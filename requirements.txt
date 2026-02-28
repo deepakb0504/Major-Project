@@ -1,0 +1,9 @@
+streamlit
+ultralytics
+deep-sort-realtime
+opencv-python
+pandas
+numpy
+matplotlib
+seaborn
+deepface

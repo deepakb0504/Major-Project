@@ -1,0 +1,48 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+*.log.txt
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+venv/
+.venv/
+env/
+
+# Project outputs & uploads (generated, don't commit)
+backend/smartshop_outputs/
+backend/uploads/
+backend/models/
+
+# Large model files (download or copy locally)
+yolov8n.pt
+yolov8n.pt.zip
+*.pt
+
+# Optional: uncomment if you add env vars
+# .env
+# .env.local

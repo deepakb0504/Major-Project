@@ -1,0 +1,11 @@
+flask
+flask-cors
+opencv-python
+ultralytics
+imageio
+imageio-ffmpeg
+numpy
+pandas
+matplotlib
+seaborn
+Pillow
