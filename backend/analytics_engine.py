@@ -1,14 +1,15 @@
 """
-Analytics engine: process video with YOLO, face (age/gender), produce output video and heatmap.
+Analytics engine: process video with YOLO + built-in BoT-SORT tracking,
+risk analysis (velocity/accel -> SUDDEN_ACCEL), color by risk (green->red),
+output video, heatmap, and dwell-time analytics.
 """
 import os
 import shutil
-import uuid
 import cv2
 import numpy as np
 from pathlib import Path
 from datetime import datetime, timezone
-from collections import Counter
+from collections import defaultdict, deque
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "smartshop_outputs"
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -18,114 +19,36 @@ MODEL_PATH_LOCAL = MODELS_DIR / "yolov8n.pt"
 MODELS_DIR.mkdir(exist_ok=True)
 
 PERSON_CLASS_ID = 0
+CONFIDENCE_THRESHOLD = 0.5
+HEATMAP_GRID_SIZE = 64
+# Risk: acceleration threshold (pixels per frame^2)
+ACCEL_THRESHOLD = 15.0
+HISTORY_LEN = 8
+RISK_DECAY_FRAMES = 30
 
-# Lazy-loaded face analyzer for age/gender (InsightFace primary, DeepFace fallback)
-_face_app = None
-_face_backend = None
-
-
-def _get_face_analyzer():
-    global _face_app, _face_backend
-    if _face_app is not None or _face_backend == "none":
-        return _face_app, _face_backend
-    try:
-        from insightface.app import FaceAnalysis
-        app = FaceAnalysis(providers=["CPUExecutionProvider"], name="buffalo_l")
-        app.prepare(ctx_id=0, det_size=(640, 640))
-        _face_app = app
-        _face_backend = "insightface"
-        return _face_app, _face_backend
-    except Exception:
-        pass
-    try:
-        import deepface  # noqa: F401
-        _face_app = "deepface"
-        _face_backend = "deepface"
-        return _face_app, _face_backend
-    except Exception:
-        pass
-    _face_backend = "none"
-    return None, "none"
-
-
-def _run_face_analysis(frame_bgr, person_bboxes=None):
-    """
-    Run age/gender on frame. Returns list of (bbox_xyxy, age_int, gender_str).
-    - InsightFace: full-frame detection; person_bboxes ignored.
-    - DeepFace: crops each person_bbox and analyzes; returns one result per crop.
-    """
-    app, backend = _get_face_analyzer()
-    out = []
-    if backend == "insightface" and app is not None:
-        try:
-            faces = app.get(frame_bgr)
-            for f in faces:
-                bbox = getattr(f, "bbox", None)
-                if bbox is None or len(bbox) < 4:
-                    continue
-                age = int(getattr(f, "age", 0) or 0)
-                g = getattr(f, "gender", None)
-                if g is None:
-                    g = getattr(f, "sex", "U")
-                if isinstance(g, (int, float)):
-                    gender_str = "M" if g == 0 else "F"
-                else:
-                    gender_str = str(g).upper()[:1] if g else "U"
-                out.append((bbox, age, gender_str))
-        except Exception:
-            pass
-        return out
-    if backend == "deepface" and person_bboxes is not None:
-        from deepface import DeepFace
-        h, w = frame_bgr.shape[:2]
-        for (x1, y1, x2, y2) in person_bboxes:
-            x1, y1 = max(0, int(x1)), max(0, int(y1))
-            x2, y2 = min(w, int(x2)), min(h, int(y2))
-            if x2 <= x1 or y2 <= y1:
-                continue
-            crop = frame_bgr[y1:y2, x1:x2]
-            if crop.size == 0:
-                continue
-            try:
-                result = DeepFace.analyze(crop, actions=["age", "gender"], enforce_detection=False, silent=True)
-                if isinstance(result, list):
-                    result = result[0] if result else {}
-                age = int(result.get("age") or 0)
-                g = result.get("dominant_gender", result.get("gender", ""))
-                gender_str = str(g).upper()[:1] if g else "U"
-                out.append(((x1, y1, x2, y2), age, gender_str))
-            except Exception:
-                continue
-        return out
-    return out
+# Risk 0-5 -> BGR (green = safe, red = high/theft)
+RISK_BGR = [
+    (94, 197, 34),   # 0 green safe
+    (22, 204, 132),  # 1 lime
+    (8, 179, 234),   # 2 yellow
+    (16, 115, 249),  # 3 orange
+    (68, 68, 239),   # 4 red
+    (28, 28, 185),   # 5 dark red theft
+]
 
 
 def _utc_now_iso():
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _iou(a, b):
-    # a, b: (x1,y1,x2,y2)
-    ax1, ay1, ax2, ay2 = a
-    bx1, by1, bx2, by2 = b
-    inter_x1 = max(ax1, bx1)
-    inter_y1 = max(ay1, by1)
-    inter_x2 = min(ax2, bx2)
-    inter_y2 = min(ay2, by2)
-    iw = max(0, inter_x2 - inter_x1)
-    ih = max(0, inter_y2 - inter_y1)
-    inter = iw * ih
-    if inter <= 0:
-        return 0.0
-    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
-    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
-    denom = area_a + area_b - inter
-    return float(inter / denom) if denom > 0 else 0.0
+def _risk_to_bgr(risk):
+    r = max(0, min(5, int(risk)))
+    return RISK_BGR[r]
 
 
-def _draw_label(img, text, x, y):
+def _draw_label(img, text, x, y, color_bgr=(255, 255, 255)):
     cv2.rectangle(img, (x, y - 18), (x + 8 * len(text) + 10, y + 4), (0, 0, 0), -1)
-    cv2.putText(img, text, (x + 5, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(img, text, (x + 5, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_bgr, 1, cv2.LINE_AA)
 
 
 def get_model_path():
@@ -133,8 +56,6 @@ def get_model_path():
     Use YOLO model from backend/models/ so OneDrive doesn't lock the file.
     If only project-root yolov8n.pt exists, copy it once to backend/models/.
     """
-    # If a directory named *.pt exists (common when someone extracts a Torch checkpoint),
-    # Ultralytics can't load it. Only treat real files as valid model paths.
     if MODEL_PATH_LOCAL.is_file():
         return str(MODEL_PATH_LOCAL)
     root_pt = BACKEND_DIR.parent / "yolov8n.pt"
@@ -147,8 +68,6 @@ def get_model_path():
                 "Permission denied reading yolov8n.pt (often due to OneDrive). "
                 "Copy it manually: copy 'yolov8n.pt' into 'backend\\models\\yolov8n.pt' and try again."
             ) from e
-    # If the project has a yolov8n.pt.zip (Torch checkpoints are ZIPs internally),
-    # users sometimes rename it; use it as a last-resort source.
     root_pt_zip = BACKEND_DIR.parent / "yolov8n.pt.zip"
     if root_pt_zip.is_file():
         try:
@@ -164,8 +83,8 @@ def get_model_path():
 
 def process_video(input_path: str, job_id: str):
     """
-    Run person detection + lightweight tracking, write annotated output video and a simple heatmap.
-    Returns dict with output_video, heatmap paths (relative to OUTPUT_DIR) plus tracks + summary.
+    Run person detection + YOLO built-in tracker (BoT-SORT) for accurate IDs and dwell time.
+    Returns dict with output_video, heatmap paths, tracks, and summary.
     """
     try:
         model_path = get_model_path()
@@ -187,12 +106,10 @@ def process_video(input_path: str, job_id: str):
 
     out_basename = f"output_{job_id[:8]}.mp4"
     out_path = OUTPUT_DIR / out_basename
-    # Browser-compatible encoding: use ffmpeg via imageio if available (H.264).
     writer = None
     writer_kind = None
     try:
         import imageio
-
         writer = imageio.get_writer(
             str(out_path),
             fps=fps,
@@ -212,69 +129,18 @@ def process_video(input_path: str, job_id: str):
             writer = cv2.VideoWriter(str(out_path), fourcc, fps, (max(w, 1), max(h, 1)))
         writer_kind = "opencv"
 
-    heatmap_grid = np.zeros((32, 32), dtype=np.float32)
+    heatmap_grid = np.zeros((HEATMAP_GRID_SIZE, HEATMAP_GRID_SIZE), dtype=np.float32)
     frame_count = 0
+    tracks_data = defaultdict(lambda: {"first_frame": None, "last_frame": None, "seen_frames": 0})
+    track_history = defaultdict(lambda: deque(maxlen=HISTORY_LEN))
+    track_risk = defaultdict(lambda: {"score": 0, "decay_counter": 0})
 
-    # Simple IOU-based tracker (lightweight, no extra deps)
-    next_track_id = 1
-    tracks_active = {}  # id -> {bbox, seen_frames, missed, first_frame, last_frame}
-    tracks_all = {}  # id -> same as above, never deleted (for analytics output)
-    max_missed = max(10, int(fps * 1.5))
-    iou_threshold = 0.25
-
-    def _update_tracks(person_boxes, frame_idx):
-        nonlocal next_track_id, tracks_active, tracks_all
-        updated_ids = set()
-        # Greedy matching by best IoU
-        for pb in person_boxes:
-            best_id = None
-            best_iou = 0.0
-            for tid, t in tracks_active.items():
-                if tid in updated_ids:
-                    continue
-                i = _iou(pb, t["bbox"])
-                if i > best_iou:
-                    best_iou = i
-                    best_id = tid
-            if best_id is not None and best_iou >= iou_threshold:
-                t = tracks_active[best_id]
-                t["bbox"] = pb
-                t["seen_frames"] += 1
-                t["missed"] = 0
-                t["last_frame"] = frame_idx
-                tracks_all[best_id] = dict(t)
-                updated_ids.add(best_id)
+    def _decay_risks():
+        for tid, r in list(track_risk.items()):
+            if r["decay_counter"] > 0:
+                r["decay_counter"] -= 1
             else:
-                tid = next_track_id
-                next_track_id += 1
-                tnew = {
-                    "bbox": pb,
-                    "seen_frames": 1,
-                    "missed": 0,
-                    "first_frame": frame_idx,
-                    "last_frame": frame_idx,
-                    "age_samples": [],
-                    "gender_samples": [],
-                }
-                tracks_active[tid] = tnew
-                tracks_all[tid] = dict(tnew)
-                updated_ids.add(tid)
-
-        # Ensure age/gender lists exist for existing tracks
-        for t in tracks_active.values():
-            t.setdefault("age_samples", [])
-            t.setdefault("gender_samples", [])
-
-        # Age out tracks not updated
-        to_del = []
-        for tid, t in tracks_active.items():
-            if tid not in updated_ids:
-                t["missed"] += 1
-                tracks_all[tid] = dict(t)
-                if t["missed"] > max_missed:
-                    to_del.append(tid)
-        for tid in to_del:
-            del tracks_active[tid]
+                r["score"] = max(0, r["score"] - 1)
 
     while True:
         ret, frame = cap.read()
@@ -282,7 +148,6 @@ def process_video(input_path: str, job_id: str):
             break
         if w == 0 or h == 0:
             h, w = frame.shape[:2]
-            # If OpenCV writer was created with dummy size, re-create it now.
             if writer_kind == "opencv":
                 try:
                     writer.release()
@@ -293,90 +158,74 @@ def process_video(input_path: str, job_id: str):
                 if not writer.isOpened():
                     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                     writer = cv2.VideoWriter(str(out_path), fourcc, fps, (w, h))
-        results = model(frame, verbose=False)
-        annotated = frame.copy()
 
-        # Extract person detections
-        person_boxes = []
-        try:
-            boxes = results[0].boxes
-            if boxes is not None and len(boxes) > 0:
-                cls = boxes.cls.cpu().numpy().astype(int)
-                xyxy = boxes.xyxy.cpu().numpy()
-                conf = boxes.conf.cpu().numpy() if hasattr(boxes, "conf") and boxes.conf is not None else None
-                for i in range(len(xyxy)):
-                    if cls[i] != PERSON_CLASS_ID:
-                        continue
-                    if conf is not None and float(conf[i]) < 0.35:
-                        continue
-                    x1, y1, x2, y2 = xyxy[i]
-                    x1 = int(max(0, min(w - 1, x1)))
-                    y1 = int(max(0, min(h - 1, y1)))
-                    x2 = int(max(0, min(w - 1, x2)))
-                    y2 = int(max(0, min(h - 1, y2)))
-                    if x2 <= x1 or y2 <= y1:
-                        continue
-                    person_boxes.append((x1, y1, x2, y2))
-        except Exception:
-            person_boxes = []
-
-        _update_tracks(person_boxes, frame_count)
-
-        # Age/gender: InsightFace (Mac/Linux, best accuracy) = every 5 frames, all faces.
-        # DeepFace fallback (e.g. Windows without C++ build tools) = every 30 frames, max 2 people.
-        _get_face_analyzer()  # ensure _face_backend is set
-        run_face = (
-            os.environ.get("DISABLE_AGE_GENDER") != "1"
-            and tracks_active
-            and (
-                (_face_backend == "insightface" and frame_count % 5 == 0)
-                or (_face_backend == "deepface" and frame_count % 30 == 0)
-            )
+        results = model.track(
+            frame,
+            persist=True,
+            verbose=False,
+            classes=[PERSON_CLASS_ID],
+            conf=CONFIDENCE_THRESHOLD,
+            iou=0.45,
         )
-        if run_face:
-            if _face_backend == "insightface":
-                person_bboxes_for_face = None
-            else:
-                person_bboxes_for_face = sorted(
-                    [t["bbox"] for t in tracks_active.values()],
-                    key=lambda b: (b[2] - b[0]) * (b[3] - b[1]),
-                    reverse=True,
-                )[:2]
-            face_results = _run_face_analysis(frame, person_bboxes=person_bboxes_for_face)
-            for fbbox, age_val, gender_str in face_results:
-                fbbox = (float(fbbox[0]), float(fbbox[1]), float(fbbox[2]), float(fbbox[3]))
-                best_tid = None
-                best_iou_val = 0.0
-                for tid, t in tracks_active.items():
-                    i = _iou(t["bbox"], fbbox)
-                    if i > best_iou_val:
-                        best_iou_val = i
-                        best_tid = tid
-                if best_tid is not None and best_iou_val >= 0.15:
-                    t = tracks_active[best_tid]
-                    t.setdefault("age_samples", []).append(age_val)
-                    t.setdefault("gender_samples", []).append(gender_str)
-                    tracks_all[best_tid] = dict(t)
+        annotated = frame.copy()
+        boxes = results[0].boxes
+        if boxes is not None and boxes.id is not None:
+            ids = boxes.id.cpu().numpy().astype(int)
+            xyxy = boxes.xyxy.cpu().numpy()
+            for i in range(len(ids)):
+                tid = int(ids[i])
+                x1, y1, x2, y2 = xyxy[i]
+                x1 = int(max(0, min(w - 1, x1)))
+                y1 = int(max(0, min(h - 1, y1)))
+                x2 = int(max(0, min(w - 1, x2)))
+                y2 = int(max(0, min(h - 1, y2)))
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+                t = tracks_data[tid]
+                if t["first_frame"] is None:
+                    t["first_frame"] = frame_count
+                t["last_frame"] = frame_count
+                t["seen_frames"] += 1
+                history = track_history[tid]
+                risk_state = track_risk[tid]
+                events = []
+                if len(history) >= 2:
+                    (_, cx0, cy0) = history[-1]
+                    (_, cx1, cy1) = history[-2]
+                    dt = 1.0
+                    vx = (cx - cx0) / dt
+                    vy = (cy - cy0) / dt
+                    v_prev_x = (cx0 - cx1) / dt
+                    v_prev_y = (cy0 - cy1) / dt
+                    ax = (vx - v_prev_x) / dt
+                    ay = (vy - v_prev_y) / dt
+                    accel_mag = np.sqrt(ax * ax + ay * ay)
+                    if accel_mag >= ACCEL_THRESHOLD:
+                        events.append("SUDDEN_ACCEL")
+                        risk_state["score"] = min(5, risk_state["score"] + 1)
+                        risk_state["decay_counter"] = RISK_DECAY_FRAMES
+                history.append((frame_count, cx, cy))
+                risk = risk_state["score"]
+                state = "NORMAL" if risk == 0 else "ALERT"
+                dwell_s = t["seen_frames"] / float(fps)
+                color_bgr = _risk_to_bgr(risk)
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), color_bgr, 2)
+                label_y = max(20, y1)
+                _draw_label(annotated, f"ID {tid}", x1, label_y, color_bgr)
+                _draw_label(annotated, state, x1, label_y + 18, color_bgr)
+                _draw_label(annotated, f"Risk {risk}", x1, label_y + 36, color_bgr)
+                _draw_label(annotated, f"{dwell_s:.1f}s", x1, label_y + 54, color_bgr)
+                if events:
+                    _draw_label(annotated, " ".join(events), x1, y2 + 18, color_bgr)
+                cx_i = int((x1 + x2) / 2 * HEATMAP_GRID_SIZE / max(w, 1)) % HEATMAP_GRID_SIZE
+                cy_i = int((y1 + y2) / 2 * HEATMAP_GRID_SIZE / max(h, 1)) % HEATMAP_GRID_SIZE
+                heatmap_grid[cy_i, cx_i] += 1.0
+                t["_max_risk"] = max(t.get("_max_risk", 0), risk)
+                t["_events_set"] = t.get("_events_set", set()) | set(events)
 
-        # Draw + heatmap using track boxes (more stable than raw detections)
-        for tid, t in list(tracks_active.items()):
-            x1, y1, x2, y2 = t["bbox"]
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 255), 2)
-            dwell_s = t["seen_frames"] / float(fps)
-            age_samples = t.get("age_samples") or []
-            gender_samples = t.get("gender_samples") or []
-            age_str = str(int(np.median(age_samples))) if age_samples else ""
-            gender_str = Counter(gender_samples).most_common(1)[0][0] if gender_samples else ""
-            label = f"ID {tid}  {dwell_s:.1f}s"
-            if age_str or gender_str:
-                label += f"  {gender_str}{age_str}"
-            _draw_label(annotated, label, x1, max(20, y1))
-            cx = int((x1 + x2) / 2 * 32 / max(w, 1)) % 32
-            cy = int((y1 + y2) / 2 * 32 / max(h, 1)) % 32
-            heatmap_grid[cy, cx] += 1.0
-
+        _decay_risks()
         if writer_kind == "imageio":
-            # imageio expects RGB
             writer.append_data(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB))
         else:
             writer.write(annotated)
@@ -391,7 +240,7 @@ def process_video(input_path: str, job_id: str):
     except Exception:
         pass
 
-    # Save heatmap
+    # Heatmap: higher resolution, then resize for display
     heatmap_basename = f"heatmap_{job_id[:8]}.png"
     heatmap_path = OUTPUT_DIR / heatmap_basename
     if frame_count > 0 and heatmap_grid.max() > 0:
@@ -403,23 +252,23 @@ def process_video(input_path: str, job_id: str):
         blank = np.zeros((256, 256, 3), dtype=np.uint8)
         cv2.imwrite(str(heatmap_path), blank)
 
-    # Build tracking analytics (median age, mode gender for stability)
+    # Build tracking analytics with risk/state/events
     tracks_out = []
-    for tid, t in sorted(tracks_all.items(), key=lambda kv: kv[0]):
-        age_samples = t.get("age_samples") or []
-        gender_samples = t.get("gender_samples") or []
-        age_est = int(round(np.median(age_samples))) if age_samples else None
-        gender_est = Counter(gender_samples).most_common(1)[0][0] if gender_samples else None
-        if gender_est == "U":
-            gender_est = None
+    for tid, t in sorted(tracks_data.items(), key=lambda kv: kv[0]):
+        if t["first_frame"] is None:
+            continue
+        first_f, last_f, seen = t["first_frame"], t["last_frame"], t["seen_frames"]
+        max_risk = t.get("_max_risk", 0)
+        events_list = list(t.get("_events_set", set()))
         tracks_out.append({
             "id": int(tid),
-            "dwell_time_s": float(t["seen_frames"] / float(fps)),
-            "seen_frames": int(t["seen_frames"]),
-            "first_seen_s": float(t["first_frame"] / float(fps)),
-            "last_seen_s": float(t["last_frame"] / float(fps)),
-            "age": age_est,
-            "gender": gender_est,
+            "dwell_time_s": float(seen / float(fps)),
+            "seen_frames": int(seen),
+            "first_seen_s": float(first_f / float(fps)),
+            "last_seen_s": float(last_f / float(fps)),
+            "risk": int(max_risk),
+            "state": "ALERT" if max_risk > 0 else "NORMAL",
+            "events": events_list,
         })
 
     summary = {

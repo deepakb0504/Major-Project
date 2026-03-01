@@ -1,17 +1,21 @@
 """
-Flask API: upload video, run analytics, serve output video and heatmap.
+Flask API: upload video, run analytics, serve output video and heatmap; live real-time risk API.
 """
+import base64
 import os
 import uuid
 import json
 import threading
 from pathlib import Path
 from datetime import datetime, timezone
+import numpy as np
+import cv2
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 
 from analytics_engine import process_video, OUTPUT_DIR
+from live_risk_engine import process_live_frame, reset_live_session
 
 LATEST_LIVE_JSON = OUTPUT_DIR / "latest_live.json"
 
@@ -126,6 +130,51 @@ def serve_file(filename):
     elif ext == ".json":
         mimetype = "application/json"
     return send_file(path, as_attachment=False, download_name=filename, mimetype=mimetype, conditional=True)
+
+
+@app.route("/api/live/reset", methods=["POST"])
+def live_reset():
+    """Reset live tracker state (e.g. when starting a new live session)."""
+    try:
+        reset_live_session()
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/live/frame", methods=["POST"])
+def live_frame():
+    """
+    Accept one frame (JSON { "image": "<base64>" } or multipart "frame" file).
+    Returns { "tracks": [ { id, bbox_xyxy, state, risk, events, dwell_s } ] }.
+    """
+    frame_bgr = None
+    if request.content_type and "application/json" in request.content_type:
+        data = request.get_json(silent=True) or {}
+        b64 = data.get("image") or data.get("base64")
+        if not b64:
+            return jsonify({"error": "Missing 'image' or 'base64' in JSON body"}), 400
+        if "," in b64:
+            b64 = b64.split(",", 1)[1]
+        try:
+            raw = base64.b64decode(b64)
+        except Exception as e:
+            return jsonify({"error": f"Invalid base64: {e}"}), 400
+        buf = np.frombuffer(raw, dtype=np.uint8)
+        frame_bgr = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    elif "frame" in request.files:
+        f = request.files["frame"]
+        buf = np.frombuffer(f.read(), dtype=np.uint8)
+        frame_bgr = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    if frame_bgr is None:
+        return jsonify({"error": "Could not decode image. Send JSON { image: base64 } or multipart 'frame' file."}), 400
+    try:
+        tracks = process_live_frame(frame_bgr)
+        return jsonify({"tracks": tracks})
+    except PermissionError as e:
+        return jsonify({"error": str(e)}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":

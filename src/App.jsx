@@ -3,6 +3,13 @@ import axios from 'axios'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || ''
 
+// Risk 0 (safe) -> 5 (theft): green -> red
+function riskToColor(risk) {
+  const r = Math.max(0, Math.min(5, Number(risk) || 0))
+  const hex = ['#22c55e', '#84cc16', '#eab308', '#f97316', '#ef4444', '#b91c1c']
+  return hex[r]
+}
+
 export default function App() {
   const [analytics, setAnalytics] = useState({ output_video: null, heatmap: null, tracks: null, summary: null })
   const [uploading, setUploading] = useState(false)
@@ -16,6 +23,16 @@ export default function App() {
   const [liveReady, setLiveReady] = useState(false)
   const [liveRecording, setLiveRecording] = useState(false)
   const [livePreviewUrl, setLivePreviewUrl] = useState(null)
+  // Real-time live (risk analysis)
+  const [liveRealtimeActive, setLiveRealtimeActive] = useState(false)
+  const [liveRealtimeTracks, setLiveRealtimeTracks] = useState([])
+  const realtimeVideoRef = useRef(null)
+  const realtimeOverlayRef = useRef(null)
+  const realtimeCaptureRef = useRef(null)
+  const realtimeIntervalRef = useRef(null)
+  const CAPTURE_W = 640
+  const CAPTURE_H = 480
+  const LIVE_SEND_MS = 180
 
   const fetchLatest = () => {
     axios.get(`${API_BASE}/api/analytics/latest`)
@@ -149,12 +166,96 @@ export default function App() {
     }
   }
 
+  const startRealtimeLive = async () => {
+    setError(null)
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: CAPTURE_W, height: CAPTURE_H },
+        audio: false,
+      })
+      if (realtimeVideoRef.current) {
+        realtimeVideoRef.current.srcObject = stream
+        await realtimeVideoRef.current.play()
+      }
+      await axios.post(`${API_BASE}/api/live/reset`)
+      setLiveRealtimeActive(true)
+    } catch (e) {
+      setError(e?.message || 'Camera permission denied')
+    }
+  }
+
+  const stopRealtimeLive = () => {
+    if (realtimeIntervalRef.current) {
+      clearInterval(realtimeIntervalRef.current)
+      realtimeIntervalRef.current = null
+    }
+    const el = realtimeVideoRef.current
+    if (el && el.srcObject && el.srcObject.getTracks) {
+      el.srcObject.getTracks().forEach((t) => t.stop())
+      el.srcObject = null
+    }
+    setLiveRealtimeActive(false)
+    setLiveRealtimeTracks([])
+  }
+
+  useEffect(() => {
+    if (!liveRealtimeActive || !realtimeVideoRef.current || !realtimeOverlayRef.current || !realtimeCaptureRef.current) return
+    const video = realtimeVideoRef.current
+    const overlay = realtimeOverlayRef.current
+    const capture = realtimeCaptureRef.current
+    const ctx = overlay.getContext('2d')
+    const capCtx = capture.getContext('2d')
+    let lastSend = 0
+
+    const tick = () => {
+      if (video.readyState < 2) return
+      const now = Date.now()
+      capCtx.drawImage(video, 0, 0, CAPTURE_W, CAPTURE_H)
+      if (now - lastSend >= LIVE_SEND_MS) {
+        lastSend = now
+        const dataUrl = capture.toDataURL('image/jpeg', 0.8)
+        const base64 = dataUrl.indexOf(',') >= 0 ? dataUrl.split(',')[1] : dataUrl
+        axios.post(`${API_BASE}/api/live/frame`, { image: base64 }, { timeout: 5000 })
+          .then(({ data }) => {
+            const tracks = data.tracks || []
+            setLiveRealtimeTracks(tracks)
+            ctx.clearRect(0, 0, overlay.width, overlay.height)
+            tracks.forEach((t) => {
+              const [x1, y1, x2, y2] = t.bbox_xyxy || [0, 0, 0, 0]
+              const color = t.color_hex || riskToColor(t.risk)
+              ctx.strokeStyle = color
+              ctx.lineWidth = 2
+              ctx.strokeRect(x1, y1, x2 - x1, y2 - y1)
+              ctx.font = 'bold 14px sans-serif'
+              const lines = [`ID ${t.id}`, t.state || 'NORMAL', `Risk ${t.risk}`, `Dwell ${t.dwell_s ?? 0}s`]
+              if (Array.isArray(t.events) && t.events.length) lines.push(...t.events)
+              lines.forEach((line, i) => {
+                ctx.fillStyle = color
+                ctx.fillText(line, x1, y1 - 6 - (lines.length - 1 - i) * 16)
+              })
+              ctx.font = '12px sans-serif'
+              const bottomLabel = (t.events && t.events.length) ? t.events.join(' ') : ''
+              if (bottomLabel) {
+                ctx.fillStyle = color
+                ctx.fillText(bottomLabel, x1, y2 + 16)
+              }
+            })
+          })
+          .catch(() => {})
+      }
+    }
+    realtimeIntervalRef.current = setInterval(tick, 50)
+    return () => {
+      if (realtimeIntervalRef.current) clearInterval(realtimeIntervalRef.current)
+    }
+  }, [liveRealtimeActive])
+
   return (
     <div className="min-h-screen bg-slate-900 text-slate-100 p-6">
       <header className="mb-8">
         <h1 className="text-2xl font-bold text-slate-100">Smart Shop Analytics</h1>
         <p className="text-slate-400 text-sm mt-1">
-          Upload a video, or record a short live clip in the browser, then view tracking + outputs below.
+          Upload from PC or record from camera — both get the same output: ID, risk (green→red), dwell time, frames, events. Real-time live below.
         </p>
       </header>
 
@@ -168,7 +269,7 @@ export default function App() {
             disabled={uploading}
             className="sr-only"
           />
-          {uploading ? 'Uploading…' : 'Upload video'}
+          {uploading ? 'Uploading…' : 'Upload video (PC)'}
         </label>
         {jobStatus && (
           <span className="ml-3 text-slate-400">
@@ -181,7 +282,64 @@ export default function App() {
 
       <section className="mb-8 rounded-xl bg-slate-800/80 overflow-hidden border border-slate-700">
         <div className="px-4 py-3 border-b border-slate-700 flex items-center justify-between gap-3 flex-wrap">
-          <h2 className="text-slate-200 font-semibold">Live Camera (record 10s → upload)</h2>
+          <h2 className="text-slate-200 font-semibold">Real-time Live (risk analysis)</h2>
+          <div className="flex items-center gap-3">
+            <span className="text-white text-sm font-medium">
+              {liveRealtimeActive ? 'STABLE LIVE MODE' : ''}
+            </span>
+            {!liveRealtimeActive ? (
+              <button
+                onClick={startRealtimeLive}
+                className="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 transition text-sm font-medium"
+              >
+                Start real-time live
+              </button>
+            ) : (
+              <button
+                onClick={stopRealtimeLive}
+                className="px-4 py-2 rounded-lg bg-rose-600 hover:bg-rose-500 transition text-sm font-medium"
+              >
+                Stop
+              </button>
+            )}
+          </div>
+        </div>
+        <div className="p-4">
+          <div className="relative inline-block bg-black rounded-lg overflow-hidden border border-slate-700">
+            <video
+              ref={realtimeVideoRef}
+              width={CAPTURE_W}
+              height={CAPTURE_H}
+              className="block"
+              playsInline
+              muted
+              style={{ display: liveRealtimeActive ? 'block' : 'none' }}
+            />
+            <canvas
+              ref={realtimeOverlayRef}
+              width={CAPTURE_W}
+              height={CAPTURE_H}
+              className="absolute inset-0 pointer-events-none"
+              style={{ left: 0, top: 0 }}
+            />
+            <canvas ref={realtimeCaptureRef} width={CAPTURE_W} height={CAPTURE_H} className="hidden" aria-hidden="true" />
+            {!liveRealtimeActive && (
+              <div className="absolute inset-0 flex items-center justify-center text-slate-500 text-sm" style={{ width: CAPTURE_W, height: CAPTURE_H }}>
+                Start real-time live: ID, risk (green=safe → red=theft), dwell time, events. Processing in real time.
+              </div>
+            )}
+            {liveRealtimeActive && (
+              <div className="absolute left-2 top-2 text-white text-sm font-medium bg-black/50 px-2 py-1 rounded">
+                STABLE LIVE MODE (Stop to quit)
+              </div>
+            )}
+          </div>
+        </div>
+      </section>
+
+      <section className="mb-8 rounded-xl bg-slate-800/80 overflow-hidden border border-slate-700">
+        <div className="px-4 py-3 border-b border-slate-700 flex items-center justify-between gap-3 flex-wrap">
+          <h2 className="text-slate-200 font-semibold">Camera: record 10s → upload (same risk/dwell output)</h2>
           <div className="flex gap-2">
             {!liveReady ? (
               <button
@@ -257,7 +415,7 @@ export default function App() {
       </section>
 
       <section className="mt-6 rounded-xl bg-slate-800/80 overflow-hidden border border-slate-700">
-        <h2 className="px-4 py-3 text-slate-200 font-semibold border-b border-slate-700">Tracking (IDs, age, gender, dwell time)</h2>
+        <h2 className="px-4 py-3 text-slate-200 font-semibold border-b border-slate-700">Tracking (ID, risk, dwell, frames, events)</h2>
         <div className="p-4">
           {analytics.summary ? (
             <div className="text-slate-300 text-sm mb-4 grid gap-2 md:grid-cols-4">
@@ -276,29 +434,40 @@ export default function App() {
                 <thead className="text-slate-400">
                   <tr className="border-b border-slate-700">
                     <th className="text-left py-2 pr-3">ID</th>
-                    <th className="text-left py-2 pr-3">Age</th>
-                    <th className="text-left py-2 pr-3">Gender</th>
+                    <th className="text-left py-2 pr-3">Risk</th>
+                    <th className="text-left py-2 pr-3">State</th>
                     <th className="text-left py-2 pr-3">Dwell (s)</th>
-                    <th className="text-left py-2 pr-3">First seen (s)</th>
-                    <th className="text-left py-2 pr-3">Last seen (s)</th>
                     <th className="text-left py-2 pr-3">Frames</th>
+                    <th className="text-left py-2 pr-3">First / Last (s)</th>
+                    <th className="text-left py-2 pr-3">Events</th>
                   </tr>
                 </thead>
                 <tbody className="text-slate-200">
                   {analytics.tracks
                     .slice()
                     .sort((a, b) => (b.dwell_time_s || 0) - (a.dwell_time_s || 0))
-                    .map((t) => (
-                      <tr key={t.id} className="border-b border-slate-800">
-                        <td className="py-2 pr-3">{t.id}</td>
-                        <td className="py-2 pr-3">{t.age != null ? t.age : '—'}</td>
-                        <td className="py-2 pr-3">{t.gender === 'M' ? 'Male' : t.gender === 'F' ? 'Female' : '—'}</td>
-                        <td className="py-2 pr-3">{Number(t.dwell_time_s || 0).toFixed(1)}</td>
-                        <td className="py-2 pr-3">{Number(t.first_seen_s || 0).toFixed(1)}</td>
-                        <td className="py-2 pr-3">{Number(t.last_seen_s || 0).toFixed(1)}</td>
-                        <td className="py-2 pr-3">{t.seen_frames}</td>
-                      </tr>
-                    ))}
+                    .map((t) => {
+                      const risk = t.risk ?? 0
+                      const bg = riskToColor(risk)
+                      return (
+                        <tr key={t.id} className="border-b border-slate-800">
+                          <td className="py-2 pr-3">{t.id}</td>
+                          <td className="py-2 pr-3">
+                            <span
+                              className="inline-block min-w-[2rem] px-2 py-0.5 rounded text-center font-medium text-white"
+                              style={{ backgroundColor: bg }}
+                            >
+                              {risk}
+                            </span>
+                          </td>
+                          <td className="py-2 pr-3">{t.state ?? (risk > 0 ? 'ALERT' : 'NORMAL')}</td>
+                          <td className="py-2 pr-3">{Number(t.dwell_time_s || 0).toFixed(1)}</td>
+                          <td className="py-2 pr-3">{t.seen_frames ?? '—'}</td>
+                          <td className="py-2 pr-3">{Number(t.first_seen_s || 0).toFixed(1)} / {Number(t.last_seen_s || 0).toFixed(1)}</td>
+                          <td className="py-2 pr-3">{(t.events && t.events.length) ? t.events.join(', ') : '—'}</td>
+                        </tr>
+                      )
+                    })}
                 </tbody>
               </table>
             </div>
