@@ -257,7 +257,7 @@ export default function App() {
       </section>
 
       <section className="mt-6 rounded-xl bg-slate-800/80 overflow-hidden border border-slate-700">
-        <h2 className="px-4 py-3 text-slate-200 font-semibold border-b border-slate-700">Tracking (people IDs + dwell time)</h2>
+        <h2 className="px-4 py-3 text-slate-200 font-semibold border-b border-slate-700">Tracking (IDs, age, gender, dwell time)</h2>
         <div className="p-4">
           {analytics.summary ? (
             <div className="text-slate-300 text-sm mb-4 grid gap-2 md:grid-cols-4">
@@ -276,6 +276,8 @@ export default function App() {
                 <thead className="text-slate-400">
                   <tr className="border-b border-slate-700">
                     <th className="text-left py-2 pr-3">ID</th>
+                    <th className="text-left py-2 pr-3">Age</th>
+                    <th className="text-left py-2 pr-3">Gender</th>
                     <th className="text-left py-2 pr-3">Dwell (s)</th>
                     <th className="text-left py-2 pr-3">First seen (s)</th>
                     <th className="text-left py-2 pr-3">Last seen (s)</th>
@@ -289,6 +291,8 @@ export default function App() {
                     .map((t) => (
                       <tr key={t.id} className="border-b border-slate-800">
                         <td className="py-2 pr-3">{t.id}</td>
+                        <td className="py-2 pr-3">{t.age != null ? t.age : '—'}</td>
+                        <td className="py-2 pr-3">{t.gender === 'M' ? 'Male' : t.gender === 'F' ? 'Female' : '—'}</td>
                         <td className="py-2 pr-3">{Number(t.dwell_time_s || 0).toFixed(1)}</td>
                         <td className="py-2 pr-3">{Number(t.first_seen_s || 0).toFixed(1)}</td>
                         <td className="py-2 pr-3">{Number(t.last_seen_s || 0).toFixed(1)}</td>

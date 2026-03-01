@@ -9,3 +9,6 @@ pandas
 matplotlib
 seaborn
 Pillow
+onnxruntime
+insightface
+deepface

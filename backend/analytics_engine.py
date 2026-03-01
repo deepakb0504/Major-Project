@@ -1,5 +1,5 @@
 """
-Analytics engine: process video with YOLO, produce output video and heatmap.
+Analytics engine: process video with YOLO, face (age/gender), produce output video and heatmap.
 """
 import os
 import shutil
@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 from pathlib import Path
 from datetime import datetime, timezone
+from collections import Counter
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "smartshop_outputs"
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -17,6 +18,86 @@ MODEL_PATH_LOCAL = MODELS_DIR / "yolov8n.pt"
 MODELS_DIR.mkdir(exist_ok=True)
 
 PERSON_CLASS_ID = 0
+
+# Lazy-loaded face analyzer for age/gender (InsightFace primary, DeepFace fallback)
+_face_app = None
+_face_backend = None
+
+
+def _get_face_analyzer():
+    global _face_app, _face_backend
+    if _face_app is not None or _face_backend == "none":
+        return _face_app, _face_backend
+    try:
+        from insightface.app import FaceAnalysis
+        app = FaceAnalysis(providers=["CPUExecutionProvider"], name="buffalo_l")
+        app.prepare(ctx_id=0, det_size=(640, 640))
+        _face_app = app
+        _face_backend = "insightface"
+        return _face_app, _face_backend
+    except Exception:
+        pass
+    try:
+        import deepface  # noqa: F401
+        _face_app = "deepface"
+        _face_backend = "deepface"
+        return _face_app, _face_backend
+    except Exception:
+        pass
+    _face_backend = "none"
+    return None, "none"
+
+
+def _run_face_analysis(frame_bgr, person_bboxes=None):
+    """
+    Run age/gender on frame. Returns list of (bbox_xyxy, age_int, gender_str).
+    - InsightFace: full-frame detection; person_bboxes ignored.
+    - DeepFace: crops each person_bbox and analyzes; returns one result per crop.
+    """
+    app, backend = _get_face_analyzer()
+    out = []
+    if backend == "insightface" and app is not None:
+        try:
+            faces = app.get(frame_bgr)
+            for f in faces:
+                bbox = getattr(f, "bbox", None)
+                if bbox is None or len(bbox) < 4:
+                    continue
+                age = int(getattr(f, "age", 0) or 0)
+                g = getattr(f, "gender", None)
+                if g is None:
+                    g = getattr(f, "sex", "U")
+                if isinstance(g, (int, float)):
+                    gender_str = "M" if g == 0 else "F"
+                else:
+                    gender_str = str(g).upper()[:1] if g else "U"
+                out.append((bbox, age, gender_str))
+        except Exception:
+            pass
+        return out
+    if backend == "deepface" and person_bboxes is not None:
+        from deepface import DeepFace
+        h, w = frame_bgr.shape[:2]
+        for (x1, y1, x2, y2) in person_bboxes:
+            x1, y1 = max(0, int(x1)), max(0, int(y1))
+            x2, y2 = min(w, int(x2)), min(h, int(y2))
+            if x2 <= x1 or y2 <= y1:
+                continue
+            crop = frame_bgr[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
+            try:
+                result = DeepFace.analyze(crop, actions=["age", "gender"], enforce_detection=False, silent=True)
+                if isinstance(result, list):
+                    result = result[0] if result else {}
+                age = int(result.get("age") or 0)
+                g = result.get("dominant_gender", result.get("gender", ""))
+                gender_str = str(g).upper()[:1] if g else "U"
+                out.append(((x1, y1, x2, y2), age, gender_str))
+            except Exception:
+                continue
+        return out
+    return out
 
 
 def _utc_now_iso():
@@ -172,10 +253,17 @@ def process_video(input_path: str, job_id: str):
                     "missed": 0,
                     "first_frame": frame_idx,
                     "last_frame": frame_idx,
+                    "age_samples": [],
+                    "gender_samples": [],
                 }
                 tracks_active[tid] = tnew
                 tracks_all[tid] = dict(tnew)
                 updated_ids.add(tid)
+
+        # Ensure age/gender lists exist for existing tracks
+        for t in tracks_active.values():
+            t.setdefault("age_samples", [])
+            t.setdefault("gender_samples", [])
 
         # Age out tracks not updated
         to_del = []
@@ -234,12 +322,55 @@ def process_video(input_path: str, job_id: str):
 
         _update_tracks(person_boxes, frame_count)
 
+        # Age/gender: InsightFace (Mac/Linux, best accuracy) = every 5 frames, all faces.
+        # DeepFace fallback (e.g. Windows without C++ build tools) = every 30 frames, max 2 people.
+        _get_face_analyzer()  # ensure _face_backend is set
+        run_face = (
+            os.environ.get("DISABLE_AGE_GENDER") != "1"
+            and tracks_active
+            and (
+                (_face_backend == "insightface" and frame_count % 5 == 0)
+                or (_face_backend == "deepface" and frame_count % 30 == 0)
+            )
+        )
+        if run_face:
+            if _face_backend == "insightface":
+                person_bboxes_for_face = None
+            else:
+                person_bboxes_for_face = sorted(
+                    [t["bbox"] for t in tracks_active.values()],
+                    key=lambda b: (b[2] - b[0]) * (b[3] - b[1]),
+                    reverse=True,
+                )[:2]
+            face_results = _run_face_analysis(frame, person_bboxes=person_bboxes_for_face)
+            for fbbox, age_val, gender_str in face_results:
+                fbbox = (float(fbbox[0]), float(fbbox[1]), float(fbbox[2]), float(fbbox[3]))
+                best_tid = None
+                best_iou_val = 0.0
+                for tid, t in tracks_active.items():
+                    i = _iou(t["bbox"], fbbox)
+                    if i > best_iou_val:
+                        best_iou_val = i
+                        best_tid = tid
+                if best_tid is not None and best_iou_val >= 0.15:
+                    t = tracks_active[best_tid]
+                    t.setdefault("age_samples", []).append(age_val)
+                    t.setdefault("gender_samples", []).append(gender_str)
+                    tracks_all[best_tid] = dict(t)
+
         # Draw + heatmap using track boxes (more stable than raw detections)
         for tid, t in list(tracks_active.items()):
             x1, y1, x2, y2 = t["bbox"]
             cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 255), 2)
             dwell_s = t["seen_frames"] / float(fps)
-            _draw_label(annotated, f"ID {tid}  {dwell_s:.1f}s", x1, max(20, y1))
+            age_samples = t.get("age_samples") or []
+            gender_samples = t.get("gender_samples") or []
+            age_str = str(int(np.median(age_samples))) if age_samples else ""
+            gender_str = Counter(gender_samples).most_common(1)[0][0] if gender_samples else ""
+            label = f"ID {tid}  {dwell_s:.1f}s"
+            if age_str or gender_str:
+                label += f"  {gender_str}{age_str}"
+            _draw_label(annotated, label, x1, max(20, y1))
             cx = int((x1 + x2) / 2 * 32 / max(w, 1)) % 32
             cy = int((y1 + y2) / 2 * 32 / max(h, 1)) % 32
             heatmap_grid[cy, cx] += 1.0
@@ -272,15 +403,23 @@ def process_video(input_path: str, job_id: str):
         blank = np.zeros((256, 256, 3), dtype=np.uint8)
         cv2.imwrite(str(heatmap_path), blank)
 
-    # Build tracking analytics
+    # Build tracking analytics (median age, mode gender for stability)
     tracks_out = []
     for tid, t in sorted(tracks_all.items(), key=lambda kv: kv[0]):
+        age_samples = t.get("age_samples") or []
+        gender_samples = t.get("gender_samples") or []
+        age_est = int(round(np.median(age_samples))) if age_samples else None
+        gender_est = Counter(gender_samples).most_common(1)[0][0] if gender_samples else None
+        if gender_est == "U":
+            gender_est = None
         tracks_out.append({
             "id": int(tid),
             "dwell_time_s": float(t["seen_frames"] / float(fps)),
             "seen_frames": int(t["seen_frames"]),
             "first_seen_s": float(t["first_frame"] / float(fps)),
             "last_seen_s": float(t["last_frame"] / float(fps)),
+            "age": age_est,
+            "gender": gender_est,
         })
 
     summary = {
